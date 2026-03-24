@@ -39,146 +39,400 @@ import (
 	"github.com/google/osv-scalibr/guidedremediation/result"
 	"github.com/google/osv-scalibr/guidedremediation/strategy"
 	"github.com/google/osv-scalibr/internal/mavenutil"
-	forkedxml "github.com/michaelkedar/xml"
+	forkedxml "github.com/google/osv-scalibr/internal/xml"
 )
 
-// RequirementKey is a comparable type that uniquely identifies a package dependency in a manifest.
-type RequirementKey struct {
-	resolve.PackageKey
-
-	ArtifactType string
-	Classifier   string
+type property struct {
+	Name   string
+	Value  string
+	Origin string
 }
 
-var _ map[RequirementKey]any
+func (p property) Empty() bool {
+	return p.Name == "" && p.Value == "" && p.Origin == ""
+}
 
-// MakeRequirementKey constructs a maven RequirementKey from the given RequirementVersion.
-func MakeRequirementKey(requirement resolve.RequirementVersion) RequirementKey {
-	// Maven dependencies must have unique groupId:artifactId:type:classifier.
-	artifactType, _ := requirement.Type.GetAttr(dep.MavenArtifactType)
-	classifier, _ := requirement.Type.GetAttr(dep.MavenClassifier)
+type dependency struct {
+	Type       string     `xml:"type,omitempty"`
+	Classifier string     `xml:"classifier,omitempty"`
+	Scope      string     `xml:"scope,omitempty"`
+	SystemPath string     `xml:"systemPath,omitempty"`
+	Exclusions []struct{} `xml:"exclusions>exclusion,omitempty"` // empty struct to skip writing empty elements
+	Optional   string     `xml:"optional,omitempty"`
+	GroupID    string     `xml:"groupId"`
+	ArtifactID string     `xml:"artifactId"`
+	Version    string     `xml:"version,omitempty"`
+}
 
-	return RequirementKey{
-		PackageKey:   requirement.PackageKey,
-		ArtifactType: artifactType,
-		Classifier:   classifier,
+func makeDependency(p Patch) dependency {
+	return dependency{
+		GroupID:    p.GroupID,
+		ArtifactID: p.ArtifactID,
+		Version:    p.NewRequire,
+		Type:       p.Type,
+		Classifier: p.Classifier,
 	}
 }
 
-// ManifestSpecific is ecosystem-specific information needed for the pom.xml manifest.
-type ManifestSpecific struct {
-	Parent                 maven.Parent
-	ParentPaths            []string                     // Paths to the parent pom.xml files
-	Properties             []PropertyWithOrigin         // Properties from the base project and any local parent projects
-	OriginalRequirements   []DependencyWithOrigin       // Dependencies from the base project
-	LocalRequirements      []DependencyWithOrigin       // Dependencies from the base project and any local parent projects
-	RequirementsForUpdates []resolve.RequirementVersion // Requirements that we only need for updates
-	Repositories           []maven.Repository
+func compareDependency(a, b dependency) int {
+	if c := cmp.Compare(a.GroupID, b.GroupID); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.ArtifactID, b.ArtifactID); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.Type, b.Type); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Classifier, b.Classifier)
 }
 
-// PropertyWithOrigin is a maven property with the origin where it comes from.
+type dependencyManagement struct {
+	Dependencies []dependency `xml:"dependencies>dependency"`
+}
+
 type PropertyWithOrigin struct {
 	maven.Property
 
 	Origin string // Origin indicates where the property comes from
 }
 
-// DependencyWithOrigin is a maven dependency with the origin where it comes from.
 type DependencyWithOrigin struct {
 	maven.Dependency
 
 	Origin string // Origin indicates where the dependency comes from
 }
 
-type mavenManifest struct {
+type ManifestSpecific struct {
+	Parent            maven.Parent
+	Properties        []PropertyWithOrigin
+	LocalRequirements []DependencyWithOrigin
+	ParentPaths       []string
+}
+
+func getRequirements(project maven.Project) []resolve.RequirementVersion {
+	var requirements []resolve.RequirementVersion
+	if project.Parent.GroupID != "" && project.Parent.ArtifactID != "" {
+		requirements = append(requirements, makeRequirementVersion(maven.Dependency{
+			GroupID:    project.Parent.GroupID,
+			ArtifactID: project.Parent.ArtifactID,
+			Version:    project.Parent.Version,
+			Type:       "pom",
+		}, mavenutil.OriginParent))
+	}
+	for _, d := range project.Dependencies {
+		requirements = append(requirements, makeRequirementVersion(d, ""))
+	}
+	for _, d := range project.DependencyManagement.Dependencies {
+		requirements = append(requirements, makeRequirementVersion(d, mavenutil.OriginManagement))
+	}
+
+	return requirements
+}
+
+func makeRequirementVersion(d maven.Dependency, origin string) resolve.RequirementVersion {
+	typ := mavenutil.MavenDepType(d, origin)
+	if d.Version == "" {
+		typ.AddAttr(dep.MavenKnownAsEmptyVersion, "")
+	}
+
+	return resolve.RequirementVersion{
+		VersionKey: resolve.VersionKey{
+			PackageKey: resolve.PackageKey{
+				System: resolve.Maven,
+				Name:   d.Name(),
+			},
+			VersionType: resolve.Requirement,
+			Version:     string(d.Version),
+		},
+		Type: typ,
+	}
+}
+
+// TODO: combine PropertyPatches and DependencyPatches into one struct
+type PropertyPatches map[string]map[string]string // Origin -> map[property name] -> new value
+type DependencyPatches map[string]map[Patch]bool  // Origin -> map[Patch] -> updated
+
+type Patches struct {
+	DependencyPatches DependencyPatches
+	PropertyPatches   PropertyPatches
+}
+
+type Patch struct {
+	maven.DependencyKey
+	NewRequire string
+}
+
+// mavenOrigin returns a combined origin string from origin segments.
+// Consecutive empty strings are omitted.
+func mavenOrigin(os ...string) string {
+	return strings.Join(slices.DeleteFunc(os, func(o string) bool {
+		return o == ""
+	}), "@")
+}
+
+// parseOrigin parses a combined origin string into origin segments.
+// The returned segments are exactly three: prefix, profile or plugin, and management.
+// The prefix is the origin string of where the profile/plugin/management is found.
+// The profile or plugin is the id of the profile or plugin, if the origin string indicates so.
+// The management is OriginManagement if the origin string indicates so.
+func parseOrigin(o string) (prefix, pp, mgmt string) {
+	if strings.HasSuffix(o, "@"+mavenutil.OriginManagement) || o == mavenutil.OriginManagement {
+		mgmt = mavenutil.OriginManagement
+		o = strings.TrimSuffix(o, "@"+mavenutil.OriginManagement)
+		o = strings.TrimSuffix(o, mavenutil.OriginManagement)
+	}
+
+	i := strings.LastIndex(o, "@"+mavenutil.OriginProfile+"@")
+	if i >= 0 {
+		prefix = o[:i]
+		pp = strings.TrimPrefix(o[i+1:], mavenutil.OriginProfile+"@")
+		return prefix, pp, mgmt
+	}
+	if strings.HasPrefix(o, mavenutil.OriginProfile+"@") {
+		pp = strings.TrimPrefix(o, mavenutil.OriginProfile+"@")
+		return prefix, pp, mgmt
+	}
+
+	i = strings.LastIndex(o, "@"+mavenutil.OriginPlugin+"@")
+	if i >= 0 {
+		prefix = o[:i]
+		pp = strings.TrimPrefix(o[i+1:], mavenutil.OriginPlugin+"@")
+		return prefix, pp, mgmt
+	}
+	if strings.HasPrefix(o, mavenutil.OriginPlugin+"@") {
+		pp = strings.TrimPrefix(o, mavenutil.OriginPlugin+"@")
+		return prefix, pp, mgmt
+	}
+
+	prefix = o
+	return prefix, pp, mgmt
+}
+
+func buildOriginalRequirements(project maven.Project, originPrefix string) []DependencyWithOrigin {
+	var dependencies []DependencyWithOrigin
+	if project.Parent.GroupID != "" && project.Parent.ArtifactID != "" {
+		dependencies = append(dependencies, DependencyWithOrigin{
+			Dependency: maven.Dependency{
+				GroupID:    project.Parent.GroupID,
+				ArtifactID: project.Parent.ArtifactID,
+				Version:    project.Parent.Version,
+				Type:       "pom",
+			},
+			Origin: mavenOrigin(originPrefix, mavenutil.OriginParent),
+		})
+	}
+	for _, d := range project.Dependencies {
+		dependencies = append(dependencies, DependencyWithOrigin{Dependency: d, Origin: originPrefix})
+	}
+	for _, d := range project.DependencyManagement.Dependencies {
+		dependencies = append(dependencies, DependencyWithOrigin{
+			Dependency: d,
+			Origin:     mavenOrigin(originPrefix, mavenutil.OriginManagement),
+		})
+	}
+	for _, profile := range project.Profiles {
+		origin := mavenOrigin(originPrefix, mavenutil.OriginProfile, string(profile.ID))
+		for _, d := range profile.Dependencies {
+			dependencies = append(dependencies, DependencyWithOrigin{Dependency: d, Origin: origin})
+		}
+		for _, d := range profile.DependencyManagement.Dependencies {
+			dependencies = append(dependencies, DependencyWithOrigin{
+				Dependency: d,
+				Origin:     mavenOrigin(origin, mavenutil.OriginManagement),
+			})
+		}
+	}
+	for _, plugin := range project.Build.PluginManagement.Plugins {
+		origin := mavenOrigin(originPrefix, mavenutil.OriginPlugin, plugin.Name())
+		for _, d := range plugin.Dependencies {
+			dependencies = append(dependencies, DependencyWithOrigin{Dependency: d, Origin: origin})
+		}
+	}
+	for _, plugin := range project.Build.Plugins {
+		origin := mavenOrigin(originPrefix, mavenutil.OriginPlugin, plugin.Name())
+		for _, d := range plugin.Dependencies {
+			dependencies = append(dependencies, DependencyWithOrigin{Dependency: d, Origin: origin})
+		}
+	}
+
+	return dependencies
+}
+
+func buildPropertiesWithOrigins(project maven.Project, originPrefix string) []PropertyWithOrigin {
+	count := len(project.Properties.Properties)
+	for _, prof := range project.Profiles {
+		count += len(prof.Properties.Properties)
+	}
+	properties := make([]PropertyWithOrigin, 0, count)
+	for _, prop := range project.Properties.Properties {
+		properties = append(properties, PropertyWithOrigin{Property: prop, Origin: originPrefix})
+	}
+	for _, profile := range project.Profiles {
+		for _, prop := range profile.Properties.Properties {
+			properties = append(properties, PropertyWithOrigin{
+				Property: prop,
+				Origin:   mavenOrigin(originPrefix, mavenutil.OriginProfile, string(profile.ID)),
+			})
+		}
+	}
+
+	return properties
+}
+
+func (r readWriter) readManifest(path string, fsys scalibrfs.FS) (manifest.Manifest, error) {
+	ctx := context.Background()
+	path = filepath.ToSlash(path)
+	f, err := fsys.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var project maven.Project
+	if err := datasource.NewMavenDecoder(f).Decode(&project); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal project: %w", err)
+	}
+	properties := buildPropertiesWithOrigins(project, "")
+	origRequirements := buildOriginalRequirements(project, "")
+
+	var reqsForUpdates []resolve.RequirementVersion
+	if project.Parent.GroupID != "" && project.Parent.ArtifactID != "" {
+		reqsForUpdates = append(reqsForUpdates, makeRequirementVersion(maven.Dependency{
+			GroupID:    project.Parent.GroupID,
+			ArtifactID: project.Parent.ArtifactID,
+			Version:    project.Parent.Version,
+			Type:       "pom",
+		}, mavenutil.OriginParent))
+	}
+
+	// Empty JDK and ActivationOS indicates merging the default profiles.
+	if err := project.MergeProfiles("", maven.ActivationOS{}); err != nil {
+		return nil, fmt.Errorf("failed to merge profiles: %w", err)
+	}
+
+	// Interpolate the repositories in the project to get rid of the placeholders in URLs.
+	if err := project.InterpolateRepositories(); err != nil {
+		return nil, fmt.Errorf("failed to interpolate repositories: %w", err)
+	}
+	for _, repo := range project.Repositories {
+		if err := r.AddRegistry(ctx, datasource.MavenRegistry{
+			URL:              string(repo.URL),
+			ID:               string(repo.ID),
+			ReleasesEnabled:  repo.Releases.Enabled.Boolean(),
+			SnapshotsEnabled: repo.Snapshots.Enabled.Boolean(),
+		}); err != nil {
+			return nil, fmt.Errorf("failed to add registry %s: %w", repo.URL, err)
+		}
+	}
+
+	// Merging parents data by parsing local parent pom.xml or fetching from upstream.
+	if err := mavenutil.MergeParents(ctx, project.Parent, &project, mavenutil.Options{
+		Input:              &filesystem.ScanInput{FS: fsys, Path: path},
+		Client:             r.MavenRegistryAPIClient,
+		AddRegistry:        true,
+		AllowLocal:         true,
+		InitialParentIndex: 1,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to merge parents: %w", err)
+	}
+
+	// For dependency management imports, the dependencies that imports
+	// dependencies from other projects will be replaced by the imported
+	// dependencies, so add them to requirements first.
+	for _, dmDep := range project.DependencyManagement.Dependencies {
+		if dmDep.Scope == "import" && dmDep.Type == "pom" {
+			reqsForUpdates = append(reqsForUpdates, makeRequirementVersion(dmDep, mavenutil.OriginManagement))
+		}
+	}
+
+	// Process the dependencies:
+	//  - dedupe dependencies and dependency management
+	//  - import dependency management
+	//  - fill in missing dependency version requirement
+	project.ProcessDependencies(func(groupID, artifactID, version maven.String) (maven.DependencyManagement, error) {
+		return mavenutil.GetDependencyManagement(ctx, r.MavenRegistryAPIClient, groupID, artifactID, version)
+	})
+
+	localDeps, localProps, paths, err := getLocalDepsAndProps(fsys, path, project.Parent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local requirements and properties: %w", err)
+	}
+	origRequirements = append(origRequirements, localDeps...)
+	properties = append(properties, localProps...)
+
+	reqsForUpdates = append(reqsForUpdates, getRequirements(project)...)
+	var resolvedReqs []resolve.RequirementVersion
+	for _, req := range reqsForUpdates {
+		if !req.Type.HasAttr(dep.MavenKnownAsEmptyVersion) {
+			resolvedReqs = append(resolvedReqs, req)
+		}
+	}
+
+	m := manifestMaven{
+		filePath:     path,
+		requirements: resolvedReqs,
+		groups:       make(map[result.RequirementKey][]string),
+		specific: ManifestSpecific{
+			Parent:            project.Parent,
+			Properties:        properties,
+			LocalRequirements: origRequirements,
+			ParentPaths:       paths,
+		},
+	}
+	if err := m.addRequirementsAndGroups(project); err != nil {
+		return nil, err
+	}
+
+	return m, nil
+}
+
+type manifestMaven struct {
 	filePath     string
-	root         resolve.Version
 	requirements []resolve.RequirementVersion
-	groups       map[manifest.RequirementKey][]string
+	groups       map[result.RequirementKey][]string
 	specific     ManifestSpecific
 }
 
-// FilePath returns the path to the manifest file.
-func (m *mavenManifest) FilePath() string {
+func (m manifestMaven) FilePath() string {
 	return m.filePath
 }
 
-// Root returns the Version representing this package.
-func (m *mavenManifest) Root() resolve.Version {
-	return m.root
-}
-
-// System returns the ecosystem of this manifest.
-func (m *mavenManifest) System() resolve.System {
-	return resolve.Maven
-}
-
-// Requirements returns all direct requirements (including dev).
-func (m *mavenManifest) Requirements() []resolve.RequirementVersion {
+func (m manifestMaven) Requirements() []resolve.RequirementVersion {
 	return m.requirements
 }
 
-// Groups returns the dependency groups that the direct requirements belong to.
-func (m *mavenManifest) Groups() map[manifest.RequirementKey][]string {
+func (m manifestMaven) Groups() map[result.RequirementKey][]string {
 	return m.groups
 }
 
-// LocalManifests returns Manifests of any local packages.
-func (m *mavenManifest) LocalManifests() []manifest.Manifest {
-	return nil
-}
-
-// EcosystemSpecific returns any ecosystem-specific information for this manifest.
-func (m *mavenManifest) EcosystemSpecific() any {
+func (m manifestMaven) EcosystemSpecific() any {
 	return m.specific
 }
 
-// Clone returns a copy of this manifest that is safe to modify.
-func (m *mavenManifest) Clone() manifest.Manifest {
-	clone := &mavenManifest{
-		filePath:     m.filePath,
-		root:         m.root,
-		requirements: slices.Clone(m.requirements),
-		groups:       maps.Clone(m.groups),
-		specific: ManifestSpecific{
-			Parent:                 m.specific.Parent,
-			ParentPaths:            slices.Clone(m.specific.ParentPaths),
-			Properties:             slices.Clone(m.specific.Properties),
-			OriginalRequirements:   slices.Clone(m.specific.OriginalRequirements),
-			LocalRequirements:      slices.Clone(m.specific.LocalRequirements),
-			RequirementsForUpdates: slices.Clone(m.specific.RequirementsForUpdates),
-			Repositories:           slices.Clone(m.specific.Repositories),
-		},
+func (m *manifestMaven) addRequirementsAndGroups(project maven.Project) error {
+	m.groups = make(map[result.RequirementKey][]string)
+
+	deps := append([]maven.Dependency{}, project.Dependencies...)
+	for _, p := range project.Profiles {
+		deps = append(deps, p.Dependencies...)
 	}
-	clone.root.AttrSet = m.root.Clone()
 
-	return clone
-}
-
-// PatchRequirement modifies the manifest's requirements to include the new requirement version.
-// If the package already is in the requirements, updates the version.
-// Otherwise, adds req to the dependencyManagement of the root pom.xml.
-func (m *mavenManifest) PatchRequirement(req resolve.RequirementVersion) error {
-	found := false
-	i := 0
-	for _, r := range m.requirements {
-		if r.PackageKey != req.PackageKey {
-			m.requirements[i] = r
-			i++
-
-			continue
+	for _, d := range deps {
+		req := resolve.RequirementVersion{
+			VersionKey: resolve.VersionKey{
+				PackageKey: resolve.PackageKey{
+					System: resolve.Maven,
+					Name:   d.Name(),
+				},
+				VersionType: resolve.Requirement,
+				Version:     string(d.Version),
+			},
+			Type: resolve.MavenDepType(d, ""),
 		}
-		origin, hasOrigin := r.Type.GetAttr(dep.MavenDependencyOrigin)
-		if !hasOrigin || origin == mavenutil.OriginManagement {
-			found = true
-			r.Version = req.Version
-			m.requirements[i] = r
-			i++
+		if d.Scope == "test" || d.Scope == "provided" {
+			m.groups[result.MakeRequirementKey(req)] = append(m.groups[result.MakeRequirementKey(req)], "dev")
 		}
-	}
-	m.requirements = m.requirements[:i]
-	if !found {
-		req.Type.AddAttr(dep.MavenDependencyOrigin, mavenutil.OriginManagement)
 		m.requirements = append(m.requirements, req)
 	}
 
@@ -218,240 +472,188 @@ func (r readWriter) Read(path string, fsys scalibrfs.FS) (manifest.Manifest, err
 	if err := datasource.NewMavenDecoder(f).Decode(&project); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal project: %w", err)
 	}
-	properties := buildPropertiesWithOrigins(project, "")
-	origRequirements := buildOriginalRequirements(project, "")
 
-	var reqsForUpdates []resolve.RequirementVersion
-	if project.Parent.GroupID != "" && project.Parent.ArtifactID != "" {
-		reqsForUpdates = append(reqsForUpdates, resolve.RequirementVersion{
-			VersionKey: resolve.VersionKey{
-				PackageKey: resolve.PackageKey{
-					System: resolve.Maven,
-					Name:   project.Parent.Name(),
-				},
-				// Parent version is a concrete version, but we model parent as dependency here.
-				VersionType: resolve.Requirement,
-				Version:     string(project.Parent.Version),
-			},
-			Type: resolve.MavenDepType(maven.Dependency{Type: "pom"}, mavenutil.OriginParent),
-		})
+	if project.Parent.GroupID != "" && project.Parent.ArtifactID != "" && project.Parent.Version != "" {
+		if _, _, err := loadParentLocal(&filesystem.ScanInput{FS: fsys, Path: path}, project.Parent, path, mavenutil.FindProjectRoot(path), &maven.Project{}); err != nil {
+			return nil, fmt.Errorf("failed to verify local parent POM: %w", err)
+		}
 	}
 
-	// Empty JDK and ActivationOS indicates merging the default profiles.
-	if err := project.MergeProfiles("", maven.ActivationOS{}); err != nil {
-		return nil, fmt.Errorf("failed to merge profiles: %w", err)
-	}
+	return r.readManifest(path, fsys)
+}
 
-	// Interpolate the project in case there are properties in any repository.
-	if err := project.InterpolateRepositories(); err != nil {
-		return nil, fmt.Errorf("failed to interpolate project: %w", err)
+func resultProjectKey(k resolve.PackageKey) maven.ProjectKey {
+	i := strings.Index(k.Name, ":")
+	return maven.ProjectKey{
+		GroupID:    maven.String(k.Name[:i]),
+		ArtifactID: maven.String(k.Name[i+1:]),
 	}
-	for _, repo := range project.Repositories {
-		if repo.URL.ContainsProperty() {
+}
+
+func resultDependencyKey(k result.RequirementKey) maven.DependencyKey {
+	i := strings.Index(k.Name, ":")
+	typ, _ := k.Type.Attr(dep.MavenArtifactType)
+	classifier, _ := k.Type.Attr(dep.MavenArtifactClassifier)
+	return maven.DependencyKey{
+		GroupID:    maven.String(k.Name[:i]),
+		ArtifactID: maven.String(k.Name[i+1:]),
+		Type:       maven.String(typ),
+		Classifier: maven.String(classifier),
+	}
+}
+
+// interpolate traverses the string by replacing the properties.
+// Properties that cannot be resolved are left intact.
+func interpolate(s string, properties map[string]string) string {
+	return mavenutil.InterpolateRegex.ReplaceAllStringFunc(s, func(match string) string {
+		name := strings.TrimSpace(match[2 : len(match)-1])
+		if val, ok := properties[name]; ok {
+			return val
+		}
+		return match
+	})
+}
+
+// generatePropertyPatches returns a map of property-value pairs that can be applied to s1 to reach s2.
+// It returns a boolean indicating whether it is possible.
+// Only string with a single property or multiple properties separated by . are supported.
+// e.g. s1 = "1.${minor}.3", s2 = "1.2.3" -> map[string]string{"minor": "2"}
+func generatePropertyPatches(s1, s2 string) (map[string]string, bool) {
+	if s1 == s2 {
+		return make(map[string]string), true
+	}
+	i1, i2 := 0, 0
+	patches := make(map[string]string)
+	for i1 < len(s1) && i2 < len(s2) {
+		if s1[i1] == s2[i2] {
+			i1++
+			i2++
 			continue
 		}
-		if err := r.AddRegistry(ctx, datasource.MavenRegistry{
-			URL:              string(repo.URL),
-			ID:               string(repo.ID),
-			ReleasesEnabled:  repo.Releases.Enabled.Boolean(),
-			SnapshotsEnabled: repo.Snapshots.Enabled.Boolean(),
-		}); err != nil {
-			return nil, fmt.Errorf("failed to add registry %s: %w", repo.URL, err)
+		if s1[i1] == '$' && i1+1 < len(s1) && s1[i1+1] == '{' {
+			end := strings.Index(s1[i1:], "}")
+			if end < 0 {
+				return nil, false
+			}
+			prop := strings.TrimSpace(s1[i1+2 : i1+end])
+			i1 += end + 1
+
+			// Properties can only be separated by "."
+			next1 := strings.Index(s1[i1:], ".")
+			var next2 int
+			if next1 < 0 {
+				next1 = len(s1)
+				next2 = len(s2)
+			} else {
+				next1 += i1
+				next2 = strings.Index(s2[i2:], s1[i1:next1])
+				if next2 < 0 {
+					return nil, false
+				}
+				next2 += i2
+			}
+			patches[prop] = s2[i2:next2]
+			i2 = next2
+			continue
 		}
+		return nil, false
+	}
+	if i1 != len(s1) || i2 != len(s2) {
+		return nil, false
 	}
 
-	// Merging parents data by parsing local parent pom.xml or fetching from upstream.
-	if err := mavenutil.MergeParents(ctx, project.Parent, &project, mavenutil.Options{
-		Input:              &filesystem.ScanInput{FS: fsys, Path: path},
-		Client:             r.MavenRegistryAPIClient,
-		AddRegistry:        true,
-		AllowLocal:         true,
-		InitialParentIndex: 1,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to merge parents: %w", err)
-	}
-
-	// For dependency management imports, the dependencies that imports
-	// dependencies from other projects will be replaced by the imported
-	// dependencies, so add them to requirements first.
-	for _, dep := range project.DependencyManagement.Dependencies {
-		if dep.Scope == "import" && dep.Type == "pom" {
-			reqsForUpdates = append(reqsForUpdates, makeRequirementVersion(dep, mavenutil.OriginManagement))
-		}
-	}
-
-	// Process the dependencies:
-	//  - dedupe dependencies and dependency management
-	//  - import dependency management
-	//  - fill in missing dependency version requirement
-	project.ProcessDependencies(func(groupID, artifactID, version maven.String) (maven.DependencyManagement, error) {
-		return mavenutil.GetDependencyManagement(ctx, r.MavenRegistryAPIClient, groupID, artifactID, version)
-	})
-
-	groups := make(map[manifest.RequirementKey][]string)
-	requirements := addRequirements([]resolve.RequirementVersion{}, groups, project.Dependencies, "")
-	requirements = addRequirements(requirements, groups, project.DependencyManagement.Dependencies, mavenutil.OriginManagement)
-
-	// Requirements may not appear in the dependency graph but needs to be updated.
-	for _, profile := range project.Profiles {
-		reqsForUpdates = addRequirements(reqsForUpdates, groups, profile.Dependencies, "")
-		reqsForUpdates = addRequirements(reqsForUpdates, groups, profile.DependencyManagement.Dependencies, mavenutil.OriginManagement)
-	}
-	for _, plugin := range project.Build.PluginManagement.Plugins {
-		reqsForUpdates = addRequirements(reqsForUpdates, groups, plugin.Dependencies, "")
-	}
-
-	// Get the local dependencies and properties from all parent projects.
-	localDeps, localProps, paths, err := getLocalDepsAndProps(fsys, path, project.Parent)
-	if err != nil {
-		return nil, err
-	}
-
-	return &mavenManifest{
-		filePath: path,
-		root: resolve.Version{
-			VersionKey: resolve.VersionKey{
-				PackageKey: resolve.PackageKey{
-					System: resolve.Maven,
-					Name:   project.ProjectKey.Name(),
-				},
-				VersionType: resolve.Concrete,
-				Version:     string(project.Version),
-			},
-		},
-		requirements: requirements,
-		groups:       groups,
-		specific: ManifestSpecific{
-			Parent:                 project.Parent,
-			ParentPaths:            paths,
-			Properties:             append(properties, localProps...),
-			OriginalRequirements:   origRequirements,
-			LocalRequirements:      append(origRequirements, localDeps...),
-			RequirementsForUpdates: reqsForUpdates,
-			Repositories:           project.Repositories,
-		},
-	}, nil
+	return patches, true
 }
 
-func addRequirements(reqs []resolve.RequirementVersion, groups map[manifest.RequirementKey][]string, deps []maven.Dependency, origin string) []resolve.RequirementVersion {
-	for _, d := range deps {
-		reqVer := makeRequirementVersion(d, origin)
-		reqs = append(reqs, reqVer)
-		if d.Scope != "" {
-			reqKey := MakeRequirementKey(reqVer)
-			groups[reqKey] = append(groups[reqKey], string(d.Scope))
+func buildPatches(patches []result.Patch, specific ManifestSpecific) (map[string]Patches, error) {
+	allPatches := make(map[string]Patches)
+	for _, patch := range patches {
+		if _, ok := patch.Manifest.EcosystemSpecific().(ManifestSpecific); !ok {
+			return nil, errors.New("invalid maven ManifestSpecific data")
+		}
+		for _, depPatch := range patch.Deps {
+			depKey := resultDependencyKey(depPatch.Pkg)
+			for _, origReq := range specific.LocalRequirements {
+				if origReq.Key() != depKey || string(origReq.Version) != depPatch.OrigRequire {
+					continue
+				}
+
+				prefix, pp, mgmt := parseOrigin(origReq.Origin)
+				if _, ok := allPatches[prefix]; !ok {
+					allPatches[prefix] = Patches{
+						DependencyPatches: make(DependencyPatches),
+						PropertyPatches:   make(PropertyPatches),
+					}
+				}
+
+				// The origin of the requirement is used to determine where to apply the patch.
+				// If the original requirement contains properties, we try to apply patches to the properties instead.
+				// But we only patch the properties if the property is defined in the same file.
+				// If the property is not defined in the same file, we apply the patch to the requirement.
+				var props map[string]string
+				possible := false
+				if strings.Contains(string(origReq.Version), "$") {
+					props, possible = generatePropertyPatches(string(origReq.Version), depPatch.NewRequire)
+				}
+				patchedProps := false
+				if possible && len(props) > 0 {
+					patchedProps = true
+					for k, v := range props {
+						found := false
+						for _, prop := range specific.Properties {
+							if string(prop.Name) == k && string(prop.Value) != v {
+								propPrefix, propPP, _ := parseOrigin(prop.Origin)
+								if prefix == propPrefix {
+									if _, ok := allPatches[prefix].PropertyPatches[prop.Origin]; !ok {
+										allPatches[prefix].PropertyPatches[prop.Origin] = make(map[string]string)
+									}
+									allPatches[prefix].PropertyPatches[prop.Origin][k] = v
+									found = true
+								} else {
+									// The property is not defined in the same file as the requirement.
+									// E.g. The dependency is in a profile, but the property is defined globally.
+									// In this case, we prefer to patch the requirement directly.
+									// As patching the property globally may affect other dependencies.
+									patchedProps = false
+									break
+								}
+							}
+						}
+						if !found {
+							// The property is not found, possibly defined outside the project (e.g. from command line).
+							// So we patch the requirement directly.
+							patchedProps = false
+							break
+						}
+					}
+				}
+
+				if !patchedProps {
+					if _, ok := allPatches[prefix].DependencyPatches[origReq.Origin]; !ok {
+						allPatches[prefix].DependencyPatches[origReq.Origin] = make(map[Patch]bool)
+					}
+					// For property-based requirement we cannot patch, we directly replace it with the new requirement.
+					allPatches[prefix].DependencyPatches[origReq.Origin][Patch{
+						DependencyKey: depKey,
+						NewRequire:    depPatch.NewRequire,
+					}] = false
+				}
+
+				if prefix == "" && pp == "" && mgmt == "" && depKey == specific.Parent.Key() {
+					// Originating from the parent
+					if _, ok := allPatches[""].DependencyPatches["parent"]; !ok {
+						allPatches[""].DependencyPatches["parent"] = make(map[Patch]bool)
+					}
+					allPatches[""].DependencyPatches["parent"][Patch{
+						DependencyKey: depKey,
+						NewRequire:    depPatch.NewRequire,
+					}] = false
+				}
+			}
 		}
 	}
 
-	return reqs
-}
-
-func buildPropertiesWithOrigins(project maven.Project, originPrefix string) []PropertyWithOrigin {
-	count := len(project.Properties.Properties)
-	for _, prof := range project.Profiles {
-		count += len(prof.Properties.Properties)
-	}
-	properties := make([]PropertyWithOrigin, 0, count)
-	for _, prop := range project.Properties.Properties {
-		properties = append(properties, PropertyWithOrigin{Property: prop})
-	}
-	for _, profile := range project.Profiles {
-		for _, prop := range profile.Properties.Properties {
-			properties = append(properties, PropertyWithOrigin{
-				Property: prop,
-				Origin:   mavenOrigin(originPrefix, mavenutil.OriginProfile, string(profile.ID)),
-			})
-		}
-	}
-
-	return properties
-}
-
-func buildOriginalRequirements(project maven.Project, originPrefix string) []DependencyWithOrigin {
-	var dependencies []DependencyWithOrigin //nolint:prealloc
-	if project.Parent.GroupID != "" && project.Parent.ArtifactID != "" {
-		dependencies = append(dependencies, DependencyWithOrigin{
-			Dependency: maven.Dependency{
-				GroupID:    project.Parent.GroupID,
-				ArtifactID: project.Parent.ArtifactID,
-				Version:    project.Parent.Version,
-				Type:       "pom",
-			},
-			Origin: mavenOrigin(originPrefix, mavenutil.OriginParent),
-		})
-	}
-	for _, d := range project.Dependencies {
-		dependencies = append(dependencies, DependencyWithOrigin{Dependency: d, Origin: originPrefix})
-	}
-	for _, d := range project.DependencyManagement.Dependencies {
-		dependencies = append(dependencies, DependencyWithOrigin{
-			Dependency: d,
-			Origin:     mavenOrigin(originPrefix, mavenutil.OriginManagement),
-		})
-	}
-	for _, prof := range project.Profiles {
-		for _, d := range prof.Dependencies {
-			dependencies = append(dependencies, DependencyWithOrigin{
-				Dependency: d,
-				Origin:     mavenOrigin(originPrefix, mavenutil.OriginProfile, string(prof.ID)),
-			})
-		}
-		for _, d := range prof.DependencyManagement.Dependencies {
-			dependencies = append(dependencies, DependencyWithOrigin{
-				Dependency: d,
-				Origin:     mavenOrigin(originPrefix, mavenutil.OriginProfile, string(prof.ID), mavenutil.OriginManagement),
-			})
-		}
-	}
-	for _, plugin := range project.Build.PluginManagement.Plugins {
-		for _, d := range plugin.Dependencies {
-			dependencies = append(dependencies, DependencyWithOrigin{
-				Dependency: d,
-				Origin:     mavenOrigin(originPrefix, mavenutil.OriginPlugin, plugin.Name()),
-			})
-		}
-	}
-
-	return dependencies
-}
-
-// For dependencies in profiles and plugins, we use origin to indicate where they are from.
-// The origin is in the format prefix@identifier[@postfix] (where @ is the separator):
-//   - prefix indicates it is from profile or plugin
-//   - identifier to locate the profile/plugin which is profile ID or plugin name
-//   - (optional) suffix indicates if this is a dependency management
-func makeRequirementVersion(dep maven.Dependency, origin string) resolve.RequirementVersion {
-	// Treat test & optional dependencies as regular dependencies to force the resolver to resolve them.
-	if dep.Scope == "test" {
-		dep.Scope = ""
-	}
-	dep.Optional = ""
-
-	return resolve.RequirementVersion{
-		VersionKey: resolve.VersionKey{
-			PackageKey: resolve.PackageKey{
-				System: resolve.Maven,
-				Name:   dep.Name(),
-			},
-			VersionType: resolve.Requirement,
-			Version:     string(dep.Version),
-		},
-		Type: resolve.MavenDepType(dep, origin),
-	}
-}
-
-func mavenOrigin(list ...string) string {
-	result := ""
-	for _, str := range list {
-		if result != "" && str != "" {
-			result += "@"
-		}
-		if str != "" {
-			result += str
-		}
-	}
-
-	return result
+	return allPatches, nil
 }
 
 // TODO: refactor MergeParents to return local requirements and properties
@@ -461,6 +663,7 @@ func getLocalDepsAndProps(fsys scalibrfs.FS, path string, parent maven.Parent) (
 
 	// Walk through local parent pom.xml for original dependencies and properties.
 	currentPath := path
+	rootPath := mavenutil.FindProjectRoot(currentPath)
 	visited := make(map[maven.ProjectKey]bool, mavenutil.MaxParent)
 	paths := []string{currentPath}
 	for range mavenutil.MaxParent {
@@ -473,7 +676,7 @@ func getLocalDepsAndProps(fsys scalibrfs.FS, path string, parent maven.Parent) (
 		}
 		visited[parent.ProjectKey] = true
 
-		currentPath = mavenutil.ParentPOMPath(&filesystem.ScanInput{FS: fsys}, currentPath, string(parent.RelativePath))
+		currentPath = mavenutil.ParentPOMPath(&filesystem.ScanInput{FS: fsys}, currentPath, string(parent.RelativePath), rootPath)
 		if currentPath == "" {
 			// No more local parent pom.xml exists.
 			break
@@ -534,306 +737,55 @@ func (r readWriter) Write(original manifest.Manifest, fsys scalibrfs.FS, patches
 		}
 		in := new(bytes.Buffer)
 		if _, err := in.ReadFrom(depFile); err != nil {
-			return fmt.Errorf("failed to read from filesystem: %w", err)
+			depFile.Close()
+			return fmt.Errorf("failed to read from DepFile: %w", err)
 		}
-		depFile.Close() // Make sure the file is closed before we start writing to it.
+		depFile.Close()
 
-		out := new(bytes.Buffer)
-		if err := write(in.String(), out, patches); err != nil {
-			return err
-		}
-		// Write the patched parent relative to the new outputPath
-		relativePatch, err := filepath.Rel(original.FilePath(), patchPath)
-		if err != nil {
-			return err
-		}
-		patchPath = filepath.Join(outputPath, relativePatch)
-		if err := os.MkdirAll(filepath.Dir(patchPath), 0755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(patchPath, out.Bytes(), 0644); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// Patches represents all the dependencies and properties to be updated
-type Patches struct {
-	DependencyPatches DependencyPatches
-	PropertyPatches   PropertyPatches
-}
-
-// Patch represents an individual dependency to be upgraded, and the version to upgrade to
-type Patch struct {
-	maven.DependencyKey
-
-	NewRequire string
-}
-
-// DependencyPatches represent the dependencies to be updated, which
-// is a map of dependency patches of each origin.
-type DependencyPatches map[string]map[Patch]bool //  origin -> patch -> whether from this project
-
-// addPatch adds a patch to the patches map indexed by origin.
-// exist indicates whether this patch comes from the project.
-func (m DependencyPatches) addPatch(changedDep result.PackageUpdate, exist bool) error {
-	d, o, err := resolve.MavenDepTypeToDependency(changedDep.Type)
-	if err != nil {
-		return fmt.Errorf("MavenDepTypeToDependency: %w", err)
-	}
-
-	// If this dependency did not already exist in the project, we want to add it to the dependencyManagement section
-	if !exist {
-		o = mavenutil.OriginManagement
-	}
-
-	substrings := strings.Split(changedDep.Name, ":")
-	if len(substrings) != 2 {
-		return fmt.Errorf("invalid Maven name: %s", changedDep.Name)
-	}
-	d.GroupID = maven.String(substrings[0])
-	d.ArtifactID = maven.String(substrings[1])
-
-	if _, ok := m[o]; !ok {
-		m[o] = make(map[Patch]bool)
-	}
-	m[o][Patch{
-		DependencyKey: d.Key(),
-		NewRequire:    changedDep.VersionTo,
-	}] = exist
-
-	return nil
-}
-
-// PropertyPatches represent the properties to be updated, which
-// is a map of properties of each origin.
-type PropertyPatches map[string]map[string]string // origin -> tag -> value
-
-// parentPathFromOrigin returns the parent path embedded in origin,
-// as well as the remaining origin string.
-func parentPathFromOrigin(origin string) (string, string) {
-	tokens := strings.Split(origin, "@")
-	if len(tokens) <= 1 {
-		return "", origin
-	}
-	if tokens[0] != mavenutil.OriginParent {
-		return "", origin
-	}
-
-	return tokens[1], strings.Join(tokens[2:], "")
-}
-
-func iterUpgrades(patches []result.Patch) iter.Seq[result.PackageUpdate] {
-	return func(yield func(result.PackageUpdate) bool) {
-		for _, patch := range patches {
-			for _, update := range patch.PackageUpdates {
-				if !yield(update) {
-					return
-				}
-			}
-		}
-	}
-}
-
-// buildPatches returns dependency patches ready for updates.
-func buildPatches(patches []result.Patch, specific ManifestSpecific) (map[string]Patches, error) {
-	result := make(map[string]Patches)
-	for patch := range iterUpgrades(patches) {
-		var path string
-		origDep := OriginalDependency(patch, specific.LocalRequirements)
-		path, origDep.Origin = parentPathFromOrigin(origDep.Origin)
-		if _, ok := result[path]; !ok {
-			result[path] = Patches{
-				DependencyPatches: DependencyPatches{},
-				PropertyPatches:   PropertyPatches{},
-			}
-		}
-		if origDep.Name() == ":" {
-			// An empty name indicates the dependency is not found, so the original dependency is not in the base project.
-			// Add it so that it will be written into the dependencyManagement section.
-			if err := result[path].DependencyPatches.addPatch(patch, false); err != nil {
-				return nil, err
-			}
-
-			continue
+		var out bytes.Buffer
+		if err := write(in.String(), &out, patches); err != nil {
+			return fmt.Errorf("failed to write patched manifest: %w", err)
 		}
 
-		patch.Type = resolve.MavenDepType(origDep.Dependency, origDep.Origin)
-		if !origDep.Version.ContainsProperty() {
-			// The original requirement does not contain a property placeholder.
-			if err := result[path].DependencyPatches.addPatch(patch, true); err != nil {
-				return nil, err
-			}
-
-			continue
-		}
-
-		properties, ok := generatePropertyPatches(string(origDep.Version), patch.VersionTo)
-		if !ok {
-			// Not able to update properties to update the requirement.
-			// Update the dependency directly instead.
-			if err := result[path].DependencyPatches.addPatch(patch, true); err != nil {
-				return nil, err
-			}
-
-			continue
-		}
-
-		depOrigin := origDep.Origin
-		if strings.HasPrefix(depOrigin, mavenutil.OriginProfile) {
-			// Dependency management is not indicated in property origin.
-			depOrigin, _ = strings.CutSuffix(depOrigin, "@"+mavenutil.OriginManagement)
+		path := patchPath
+		if path == original.FilePath() {
+			path = outputPath
 		} else {
-			// Properties are defined either universally or in a profile. For property
-			// origin not starting with 'profile', this is an universal property.
-			depOrigin = ""
-		}
-
-		for name, value := range properties {
-			// A dependency in a profile may contain properties from this profile or
-			// properties universally defined. We need to figure out the origin of these
-			// properties. If a property is defined both universally and in the profile,
-			// we use the profile's origin.
-			propertyOrigin := ""
-			for _, p := range specific.Properties {
-				if p.Name == name && p.Origin != "" && p.Origin == depOrigin {
-					propertyOrigin = depOrigin
-				}
+			rel, err := filepath.Rel(filepath.Dir(original.FilePath()), path)
+			if err != nil {
+				return fmt.Errorf("failed to get relative path: %w", err)
 			}
-			if _, ok := result[path].PropertyPatches[propertyOrigin]; !ok {
-				result[path].PropertyPatches[propertyOrigin] = make(map[string]string)
-			}
-			// This property has been set to update to a value. If both values are the
-			// same, we do nothing; otherwise, instead of updating the property, we
-			// should update the dependency directly.
-			if preset, ok := result[path].PropertyPatches[propertyOrigin][name]; !ok {
-				result[path].PropertyPatches[propertyOrigin][name] = value
-			} else if preset != value {
-				if err := result[path].DependencyPatches.addPatch(patch, true); err != nil {
-					return nil, err
-				}
+			path = filepath.Join(filepath.Dir(outputPath), rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return fmt.Errorf("failed to create directory %s: %w", filepath.Dir(path), err)
 			}
 		}
-	}
 
-	return result, nil
-}
-
-// OriginalDependency returns the original dependency of a dependency patch.
-// If the dependency is not found in any local pom.xml, an empty dependency is returned.
-func OriginalDependency(patch result.PackageUpdate, origDeps []DependencyWithOrigin) DependencyWithOrigin {
-	IDs := strings.Split(patch.Name, ":")
-	if len(IDs) != 2 {
-		return DependencyWithOrigin{}
-	}
-
-	dependency, _, _ := resolve.MavenDepTypeToDependency(patch.Type)
-	dependency.GroupID = maven.String(IDs[0])
-	dependency.ArtifactID = maven.String(IDs[1])
-
-	for _, d := range origDeps {
-		if d.Key() == dependency.Key() && d.Version != "" {
-			// If the version is empty, keep looking until we find some non-empty requirement.
-			return d
+		if err := os.WriteFile(path, out.Bytes(), 0644); err != nil {
+			return err
 		}
 	}
 
-	return DependencyWithOrigin{}
+	return nil
 }
 
-// generatePropertyPatches returns whether we are able to assign values to
-// placeholder keys to convert s1 to s2, as well as the generated patches.
-// s1 contains property placeholders like '${name}' and s2 is the target string.
-func generatePropertyPatches(s1, s2 string) (map[string]string, bool) {
-	patches := make(map[string]string)
-	ok := generatePropertyPatchesAux(s1, s2, patches)
+// projectStartElement finds the first tag element in the xml string.
+func projectStartElement(s string) string {
+	for i, c := range s {
+		if c == '<' {
+			if strings.HasPrefix(s[i:], "<?") || strings.HasPrefix(s[i:], "<!--") || strings.HasPrefix(s[i:], "<!") {
+				continue
+			}
 
-	return patches, ok
-}
-
-// generatePropertyPatchesAux generates property patches and store them in patches.
-// TODO: property may refer to another property ${${name}.version}
-func generatePropertyPatchesAux(s1, s2 string, patches map[string]string) bool {
-	start := strings.Index(s1, "${")
-	if s1[:start] != s2[:start] {
-		// Cannot update property to match the prefix
-		return false
-	}
-	end := strings.Index(s1, "}")
-	next := strings.Index(s1[end+1:], "${")
-	if next < 0 {
-		// There are no more placeholders.
-		remainder := s1[end+1:]
-		if remainder == s2[len(s2)-len(remainder):] {
-			patches[s1[start+2:end]] = s2[start : len(s2)-len(remainder)]
-			return true
+			// find the end of the start element
+			if end := strings.Index(s[i:], ">"); end > 0 {
+				return s[:i+end+1]
+			}
+			break
 		}
-	} else if match := strings.Index(s2[start:], s1[end+1:end+1+next]); match > 0 {
-		// Try to match the substring between two property placeholders.
-		patches[s1[start+2:end]] = s2[start : start+match]
-		return generatePropertyPatchesAux(s1[end+1:], s2[start+match:], patches)
 	}
 
-	return false
-}
-
-func projectStartElement(raw string) string {
-	start := strings.Index(raw, "<project")
-	if start < 0 {
-		return ""
-	}
-	end := strings.Index(raw[start:], ">")
-	if end < 0 {
-		return ""
-	}
-
-	return raw[start : start+end+1]
-}
-
-// Only for writing dependencies that are not from the base project.
-type dependencyManagement struct {
-	Dependencies []dependency `xml:"dependencies>dependency,omitempty"`
-}
-
-type dependency struct {
-	GroupID    string `xml:"groupId,omitempty"`
-	ArtifactID string `xml:"artifactId,omitempty"`
-	Version    string `xml:"version,omitempty"`
-	Type       string `xml:"type,omitempty"`
-	Classifier string `xml:"classifier,omitempty"`
-}
-
-func makeDependency(patch Patch) dependency {
-	d := dependency{
-		GroupID:    string(patch.GroupID),
-		ArtifactID: string(patch.ArtifactID),
-		Version:    patch.NewRequire,
-		Classifier: string(patch.Classifier),
-	}
-	if patch.Type != "" && patch.Type != "jar" {
-		d.Type = string(patch.Type)
-	}
-
-	return d
-}
-
-func compareDependency(d1, d2 dependency) int {
-	if i := cmp.Compare(d1.GroupID, d2.GroupID); i != 0 {
-		return i
-	}
-	if i := cmp.Compare(d1.ArtifactID, d2.ArtifactID); i != 0 {
-		return i
-	}
-	if i := cmp.Compare(d1.Type, d2.Type); i != 0 {
-		return i
-	}
-	if i := cmp.Compare(d1.Classifier, d2.Classifier); i != 0 {
-		return i
-	}
-
-	return cmp.Compare(d1.Version, d2.Version)
+	return ""
 }
 
 func write(raw string, w io.Writer, patches Patches) error {
