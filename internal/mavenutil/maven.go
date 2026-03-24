@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package mavenutil provides utilities for merging Maven pom/xml.
+// Package mavenutil provides utility functions for Maven projects.
 package mavenutil
 
 import (
 	"context"
+	"os"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -29,7 +30,9 @@ import (
 	"github.com/google/osv-scalibr/extractor/filesystem"
 )
 
-// Origin of the dependencies.
+const MaxParent = 100
+
+// Origin indicators for dependencies and properties
 const (
 	OriginManagement = "management"
 	OriginParent     = "parent"
@@ -37,19 +40,17 @@ const (
 	OriginProfile    = "profile"
 )
 
-// MaxParent sets a limit on the number of parents to avoid indefinite loop.
-const MaxParent = 100
-
-// Options for merging parent data.
-//   - Input is the scan input for the current project.
-//   - Client is the Maven registry API client for fetching remote pom.xml.
-//   - AllowLocal indicates whether parsing local parent pom.xml is allowed.
-//   - InitialParentIndex indicates the index of the current parent project, which is
-//     used to check if the packaging has to be `pom`.
+// Options holds options for getting dependency management.
+// Input indicates where the current maven project originates.
+// It is used to get parent from local file system when needed.
+// AddRegistry indicates whether to add the Maven repositories in the project to the client.
+// AllowLocal indicates whether to allow parsing parent pom.xml locally.
+// InitialParentIndex indicates the index of the first parent project.
+// The value of InitialParentIndex is usually 0 if we fetch the parent from
+// the project itself, but it can be 1 if the parent comes from the import dependency.
 type Options struct {
-	Input  *filesystem.ScanInput
-	Client *datasource.MavenRegistryAPIClient
-
+	Input              *filesystem.ScanInput
+	Client             *datasource.MavenRegistryAPIClient
 	AddRegistry        bool
 	AllowLocal         bool
 	InitialParentIndex int
@@ -62,8 +63,10 @@ type Options struct {
 //   - opts holds the options for merging parent data.
 func MergeParents(ctx context.Context, current maven.Parent, result *maven.Project, opts Options) error {
 	currentPath := ""
+	rootPath := ""
 	if opts.Input != nil {
 		currentPath = opts.Input.Path
+		rootPath = FindProjectRoot(currentPath)
 	}
 
 	allowLocal := opts.AllowLocal
@@ -83,7 +86,7 @@ func MergeParents(ctx context.Context, current maven.Parent, result *maven.Proje
 		if allowLocal {
 			var parentPath string
 			var err error
-			parentFoundLocally, parentPath, err = loadParentLocal(opts.Input, current, currentPath, &proj)
+			parentFoundLocally, parentPath, err = loadParentLocal(opts.Input, current, currentPath, rootPath, &proj)
 			if err != nil {
 				return fmt.Errorf("failed to load parent at %s: %w", currentPath, err)
 			}
@@ -130,8 +133,8 @@ func MergeParents(ctx context.Context, current maven.Parent, result *maven.Proje
 
 // loadParentLocal loads a parent Maven project from local file system
 // and returns whether parent is found locally as well as parent path.
-func loadParentLocal(input *filesystem.ScanInput, parent maven.Parent, path string, result *maven.Project) (bool, string, error) {
-	parentPath := ParentPOMPath(input, path, string(parent.RelativePath))
+func loadParentLocal(input *filesystem.ScanInput, parent maven.Parent, path string, rootPath string, result *maven.Project) (bool, string, error) {
+	parentPath := ParentPOMPath(input, path, string(parent.RelativePath), rootPath)
 	if parentPath == "" {
 		return false, "", nil
 	}
@@ -188,11 +191,62 @@ func ProjectKey(proj maven.Project) maven.ProjectKey {
 	return proj.ProjectKey
 }
 
+
+// FindProjectRoot attempts to find the root of the project by walking up the directory
+// tree looking for a .git directory. If it reaches the root of the filesystem without
+// finding one, it falls back to the directory of the initial path.
+func FindProjectRoot(startPath string) string {
+	absPath, err := filepath.Abs(startPath)
+	if err != nil {
+		return filepath.Dir(startPath)
+	}
+
+	dir := filepath.Dir(absPath)
+	for {
+		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // Reached filesystem root
+			break
+		}
+		dir = parent
+	}
+
+	return filepath.Dir(absPath)
+}
+
+// IsWithinRoot checks if targetPath is within rootPath.
+func IsWithinRoot(rootPath, targetPath string) bool {
+	rootAbs, err := filepath.Abs(rootPath)
+	if err != nil {
+		return false
+	}
+	targetAbs, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false
+	}
+
+	rel, err := filepath.Rel(rootAbs, targetAbs)
+	if err != nil {
+		return false
+	}
+
+	// Clean the path to remove extraneous . or ..
+	rel = filepath.Clean(rel)
+
+	if rel == ".." || strings.HasPrefix(rel, ".." + string(filepath.Separator)) {
+		return false
+	}
+
+	return true
+}
+
 // ParentPOMPath returns the path of a parent pom.xml.
 // Maven looks for the parent POM first in 'relativePath', then
 // the local repository '../pom.xml', and lastly in the remote repo.
 // An empty string is returned if failed to resolve the parent path.
-func ParentPOMPath(input *filesystem.ScanInput, currentPath, relativePath string) string {
+func ParentPOMPath(input *filesystem.ScanInput, currentPath, relativePath, rootPath string) string {
 	if relativePath == "" {
 		relativePath = "../pom.xml"
 	}
@@ -200,11 +254,17 @@ func ParentPOMPath(input *filesystem.ScanInput, currentPath, relativePath string
 	path := filepath.ToSlash(filepath.Join(filepath.Dir(currentPath), relativePath))
 	if info, err := input.FS.Stat(path); err == nil {
 		if !info.IsDir() {
+			if rootPath != "" && !IsWithinRoot(rootPath, path) {
+				return ""
+			}
 			return path
 		}
 		// Current path is a directory, so look for pom.xml in the directory.
 		path = filepath.ToSlash(filepath.Join(path, "pom.xml"))
 		if _, err := input.FS.Stat(path); err == nil {
+			if rootPath != "" && !IsWithinRoot(rootPath, path) {
+				return ""
+			}
 			return path
 		}
 	}
