@@ -15,6 +15,7 @@
 package maven
 
 import (
+	"github.com/google/osv-scalibr/fs"
 	"os"
 	"strings"
 	"path/filepath"
@@ -23,7 +24,6 @@ import (
 
 	"deps.dev/util/maven"
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/osv-scalibr/fs"
 	"github.com/google/osv-scalibr/guidedremediation/result"
 	"github.com/google/osv-scalibr/testing/extracttest"
 )
@@ -692,4 +692,56 @@ func TestMavenReadWrite_Containment(t *testing.T) {
 
 	// We can also test writing back to ensure it doesn't write the parent outside.
 	// But reading is enough to prove the containment.
+}
+func TestMavenReadWrite_Containment(t *testing.T) {
+	t.Parallel()
+
+	// Create a temporary environment to test containment
+	tmpDir := t.TempDir()
+
+	// We want to simulate a workspace that is NOT in a git repo
+	// So we create a nested project inside tmpDir
+
+	projectDir := filepath.Join(tmpDir, "project")
+	os.MkdirAll(projectDir, 0755)
+
+	// Create a parent pom completely outside the project
+	outsideDir := filepath.Join(tmpDir, "outside")
+	os.MkdirAll(outsideDir, 0755)
+	err := os.WriteFile(filepath.Join(outsideDir, "pom.xml"), []byte(`<project>
+	<groupId>com.outside</groupId>
+	<artifactId>parent</artifactId>
+	<version>1.0.0</version>
+	<packaging>pom</packaging>
+</project>`), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the malicious child pom
+	childPomPath := filepath.Join(projectDir, "pom.xml")
+	err = os.WriteFile(childPomPath, []byte(`<project>
+	<parent>
+		<groupId>com.outside</groupId>
+		<artifactId>parent</artifactId>
+		<version>1.0.0</version>
+		<relativePath>../outside/pom.xml</relativePath>
+	</parent>
+	<artifactId>child</artifactId>
+</project>`), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mavenRW, err := GetReadWriter(nil)
+	if err != nil {
+		t.Fatalf("failed to create MavenReadWriter: %v", err)
+	}
+
+	fsys := fs.DirFS(filepath.Dir(tmpDir))
+
+	_, err = mavenRW.Read(strings.TrimPrefix(childPomPath, filepath.Dir(tmpDir)+"/"), fsys)
+	if err != nil {
+		t.Errorf("Read failed unexpectedly: %v", err)
+	}
 }
